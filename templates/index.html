@@ -73,8 +73,45 @@ prompt:prompt
 
 const data=await response.json();
 
-document.getElementById("results").innerHTML=
-JSON.stringify(data,null,2);
+const results = document.getElementById("results");
+
+if (data.alerts_found === 0) {
+    results.innerHTML = `
+        <h2>No matching items found 😔</h2>
+        <p>Try another search.</p>
+    `;
+} else {
+
+    let html = `<h2>${data.alerts_found} Items Found</h2>`;
+
+    data.alerts.forEach(item => {
+
+        html += `
+        <div style="
+            border:1px solid #ccc;
+            padding:15px;
+            margin:15px 0;
+            border-radius:10px;
+        ">
+
+            <h3>${item.title}</h3>
+
+            <p><b>Price:</b> $${item.price_usd}</p>
+
+            <p><b>Match Score:</b> ${item.match_score}%</p>
+
+            <p><b>Authenticity:</b> ${item.authenticity_confidence}%</p>
+
+            <a href="${item.url}" target="_blank">
+                View Listing
+            </a>
+
+        </div>
+        `;
+    });
+
+    results.innerHTML = html;
+}
 
 }
 
