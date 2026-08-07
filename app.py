@@ -43,7 +43,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 import google.generativeai as genai
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, render_template
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -517,9 +517,15 @@ flask_app = Flask(__name__)
 
 
 @flask_app.get("/")
+def home():
+    return render_template("index.html")
+
 @flask_app.get("/health")
 def health():
-    return jsonify({"status": "ok", "service": "thrift-grail-finder"}), 200
+    return jsonify({
+        "status":"ok",
+        "service":"thrift-grail-finder"
+    })
 
 
 @flask_app.post("/search")
