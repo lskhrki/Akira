@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Thrift Grail Finder</title>
+    <style>
+        body{
+            font-family:Arial,sans-serif;
+            background:#f4f4f4;
+            max-width:700px;
+            margin:auto;
+            padding:40px;
+        }
+
+        h1{
+            text-align:center;
+        }
+
+        input,button{
+            width:100%;
+            padding:12px;
+            margin:10px 0;
+            font-size:16px;
+        }
+
+        button{
+            background:#000;
+            color:white;
+            border:none;
+            cursor:pointer;
+        }
+
+        #results{
+            margin-top:30px;
+            white-space:pre-wrap;
+        }
+    </style>
+</head>
+
+<body>
+
+<h1>🧥 Thrift Grail Finder</h1>
+
+<input
+id="prompt"
+placeholder="Example: Oversized Y2K leather jacket"
+/>
+
+<button onclick="searchItem()">
+Search
+</button>
+
+<div id="results"></div>
+
+<script>
+
+async function searchItem(){
+
+const prompt=document.getElementById("prompt").value;
+
+const response=await fetch("/search",{
+
+method:"POST",
+
+headers:{
+"Content-Type":"application/json"
+},
+
+body:JSON.stringify({
+prompt:prompt
+})
+
+});
+
+const data=await response.json();
+
+document.getElementById("results").innerHTML=
+JSON.stringify(data,null,2);
+
+}
+
+</script>
+
+</body>
+</html>
