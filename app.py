@@ -43,7 +43,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 import google.generativeai as genai
-from flask import Flask, jsonify, request, render_template
+from flask import Flask, jsonify, request
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -146,6 +146,8 @@ class GraphState(TypedDict, total=False):
     listings: list[Listing]
     evaluations: list[EvaluationResult]
     alerts: list[MatchAlert]
+    scrape_debug: dict
+    warnings: list[str]
 
 
 # ============================== SCRAPERS =================================
@@ -167,10 +169,33 @@ async def _new_page(playwright):
     browser = await playwright.chromium.launch(headless=HEADLESS)
     context = await browser.new_context(user_agent=USER_AGENT, viewport={"width": 1366, "height": 900})
     page = await context.new_page()
+    page.set_default_timeout(15000)  # fail fast (15s) instead of hanging on a blocked/slow site
     return browser, context, page
 
 
-async def scrape_ebay(query: SearchQuery, max_results: int = 15) -> list[Listing]:
+_SIZE_PATTERNS = [
+    re.compile(r"\bsize\s*[:\-]?\s*([a-zA-Z0-9\.]{1,4})\b", re.IGNORECASE),
+    re.compile(r"\bus\s?(\d{1,2}(?:\.\d)?)\b", re.IGNORECASE),
+    re.compile(r"\b(\d{1,2}(?:\.\d)?)\s?(?:us|uk|eu)\b", re.IGNORECASE),
+    re.compile(r"\b(xxs|xs|s|m|l|xl|xxl|xxxl)\b", re.IGNORECASE),
+]
+
+
+def _guess_size_from_text(text: str) -> Optional[str]:
+    """Best-effort size extraction from a listing title/description.
+    eBay and Depop search cards don't expose structured size data — only
+    Grailed does — so this is a fallback, not a guarantee."""
+    for pattern in _SIZE_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            return match.group(1).upper()
+    return None
+
+
+async def scrape_ebay(query: SearchQuery, max_results: int = 15) -> tuple[list[Listing], Optional[str]]:
+    """Returns (listings, error_message). error_message is None on success,
+    even if zero listings were found (that's a selector/blocking issue, not
+    a hard failure) — check both fields to tell the two cases apart."""
     listings: list[Listing] = []
     try:
         async with async_playwright() as pw:
@@ -197,12 +222,13 @@ async def scrape_ebay(query: SearchQuery, max_results: int = 15) -> list[Listing
                     continue
             await context.close()
             await browser.close()
-    except Exception:
+    except Exception as exc:
         logger.exception("eBay scrape failed")
-    return listings
+        return listings, f"{exc.__class__.__name__}: {exc}"
+    return listings, None
 
 
-async def scrape_depop(query: SearchQuery, max_results: int = 15) -> list[Listing]:
+async def scrape_depop(query: SearchQuery, max_results: int = 15) -> tuple[list[Listing], Optional[str]]:
     listings: list[Listing] = []
     try:
         async with async_playwright() as pw:
@@ -235,12 +261,13 @@ async def scrape_depop(query: SearchQuery, max_results: int = 15) -> list[Listin
                     continue
             await context.close()
             await browser.close()
-    except Exception:
+    except Exception as exc:
         logger.exception("Depop scrape failed")
-    return listings
+        return listings, f"{exc.__class__.__name__}: {exc}"
+    return listings, None
 
 
-async def scrape_grailed(query: SearchQuery, max_results: int = 15) -> list[Listing]:
+async def scrape_grailed(query: SearchQuery, max_results: int = 15) -> tuple[list[Listing], Optional[str]]:
     listings: list[Listing] = []
     try:
         async with async_playwright() as pw:
@@ -270,19 +297,56 @@ async def scrape_grailed(query: SearchQuery, max_results: int = 15) -> list[List
                     continue
             await context.close()
             await browser.close()
-    except Exception:
+    except Exception as exc:
         logger.exception("Grailed scrape failed")
-    return listings
+        return listings, f"{exc.__class__.__name__}: {exc}"
+    return listings, None
 
 
 SCRAPERS = {Platform.EBAY: scrape_ebay, Platform.DEPOP: scrape_depop, Platform.GRAILED: scrape_grailed}
 
 
-async def gather_candidates(query: SearchQuery) -> list[Listing]:
+def _apply_size_guess(listing: Listing) -> Listing:
+    if not listing.size:
+        listing.size = _guess_size_from_text(listing.title)
+    return listing
+
+
+async def compare_platforms(query: SearchQuery) -> tuple[dict[str, list[Listing]], dict]:
+    """Fast path: scrape only, no vision evaluation. Returns listings grouped
+    by platform (for a price/availability comparison view) plus the same
+    scrape_debug diagnostics as gather_candidates."""
     platforms = query.platforms or list(SCRAPERS.keys())
     results = await asyncio.gather(*(SCRAPERS[p](query) for p in platforms))
+
+    grouped: dict[str, list[Listing]] = {}
+    debug_info: dict = {}
+    for platform, (group, error) in zip(platforms, results):
+        filtered = []
+        for listing in group:
+            if query.max_price_usd and listing.price_usd > query.max_price_usd:
+                continue
+            if query.min_price_usd and listing.price_usd < query.min_price_usd:
+                continue
+            filtered.append(_apply_size_guess(listing))
+        grouped[platform.value] = filtered
+        debug_info[platform.value] = {"scraped": len(group), "kept_after_filters": len(filtered), "error": error}
+
+    return grouped, debug_info
+
+
+async def gather_candidates(query: SearchQuery) -> tuple[list[Listing], dict]:
+    """Returns (merged_listings, debug_info). debug_info has one entry per
+    platform: {"found": N, "error": str|None} so failures are visible
+    instead of silently producing zero results."""
+    platforms = query.platforms or list(SCRAPERS.keys())
+    results = await asyncio.gather(*(SCRAPERS[p](query) for p in platforms))
+
+    debug_info: dict = {}
     seen, merged = set(), []
-    for group in results:
+    for platform, (group, error) in zip(platforms, results):
+        raw_count = len(group)
+        kept_count = 0
         for listing in group:
             key = listing.unique_key()
             if key in seen:
@@ -293,8 +357,11 @@ async def gather_candidates(query: SearchQuery) -> list[Listing]:
                 continue
             seen.add(key)
             merged.append(listing)
-    logger.info("Gathered %d unique candidates", len(merged))
-    return merged
+            kept_count += 1
+        debug_info[platform.value] = {"scraped": raw_count, "kept_after_filters": kept_count, "error": error}
+
+    logger.info("Gathered %d unique candidates: %s", len(merged), debug_info)
+    return merged, debug_info
 
 
 # ============================== EVALUATOR (Gemini) =========================
@@ -471,15 +538,19 @@ def run_telegram_bot_polling() -> None:
 async def search_node(state: GraphState) -> GraphState:
     query = state["query"]
     logger.info("🔎 Searching platforms for: %s", query.search_terms())
-    return {**state, "listings": await gather_candidates(query)}
+    listings, scrape_debug = await gather_candidates(query)
+    return {**state, "listings": listings, "scrape_debug": scrape_debug}
 
 
 async def evaluate_node(state: GraphState) -> GraphState:
     listings = state.get("listings", [])
+    warnings = list(state.get("warnings", []))
+    if not GOOGLE_API_KEY:
+        warnings.append("GOOGLE_API_KEY is not set on the server — evaluation was skipped, so nothing can pass the match threshold.")
     if not listings:
-        return {**state, "evaluations": []}
+        return {**state, "evaluations": [], "warnings": warnings}
     logger.info("🧠 Evaluating %d candidate(s)...", len(listings))
-    return {**state, "evaluations": await evaluate_listings(state["query"], listings)}
+    return {**state, "evaluations": await evaluate_listings(state["query"], listings), "warnings": warnings}
 
 
 async def alert_node(state: GraphState) -> GraphState:
@@ -515,16 +586,230 @@ async def run_search(query: SearchQuery) -> GraphState:
 
 flask_app = Flask(__name__)
 
+# Your frontend. Served directly at "/" so Render's URL opens straight into it.
+_INDEX_HTML = """<!DOCTYPE html>
+<html>
+<head>
+    <title>Thrift Grail Finder</title>
+    <style>
+        body{
+            font-family:Arial,sans-serif;
+            background:#f4f4f4;
+            max-width:800px;
+            margin:auto;
+            padding:40px;
+        }
+        h1{
+            text-align:center;
+        }
+        input,button{
+            width:100%;
+            padding:12px;
+            margin:10px 0;
+            font-size:16px;
+            box-sizing:border-box;
+        }
+        button{
+            background:#000;
+            color:white;
+            border:none;
+            cursor:pointer;
+        }
+        #results{
+            margin-top:30px;
+        }
+        .platform-block{
+            background:#fff;
+            border:1px solid #ddd;
+            border-radius:10px;
+            padding:15px 20px;
+            margin:15px 0;
+        }
+        .platform-header{
+            display:flex;
+            justify-content:space-between;
+            align-items:baseline;
+        }
+        .platform-name{
+            text-transform:capitalize;
+            font-size:20px;
+            font-weight:bold;
+        }
+        .platform-stats{
+            color:#555;
+            font-size:14px;
+        }
+        table{
+            width:100%;
+            border-collapse:collapse;
+            margin-top:10px;
+            font-size:14px;
+        }
+        th,td{
+            text-align:left;
+            padding:6px 4px;
+            border-bottom:1px solid #eee;
+        }
+        .debug{
+            margin-top:20px;
+            font-size:13px;
+            color:#666;
+            background:#fff;
+            border:1px solid #ddd;
+            border-radius:8px;
+            padding:12px;
+        }
+        .warning{
+            color:#b30000;
+            font-weight:bold;
+        }
+    </style>
+</head>
+<body>
+<h1>🧥 Thrift Grail Finder</h1>
+<input
+id="prompt"
+placeholder="Example: nike dunks"
+/>
+<button onclick="searchItem()">
+Search
+</button>
+<div id="results"></div>
+<div id="debug" class="debug" style="display:none;"></div>
+<script>
+async function searchItem(){
+const prompt=document.getElementById("prompt").value;
+const results = document.getElementById("results");
+const debugBox = document.getElementById("debug");
+results.innerHTML = "<p>Searching eBay, Depop, and Grailed... usually 5-20s.</p>";
+debugBox.style.display = "none";
+
+const response=await fetch("/compare",{
+method:"POST",
+headers:{
+"Content-Type":"application/json"
+},
+body:JSON.stringify({
+prompt:prompt
+})
+});
+const data=await response.json();
+
+if (data.warnings && data.warnings.length > 0) {
+    debugBox.style.display = "block";
+    debugBox.innerHTML = "<div class='warning'>" + data.warnings.join("<br>") + "</div>";
+}
+if (data.scrape_debug) {
+    debugBox.style.display = "block";
+    debugBox.innerHTML += "<pre>" + JSON.stringify(data.scrape_debug, null, 2) + "</pre>";
+}
+
+const platforms = data.platforms || {};
+const platformNames = Object.keys(platforms);
+const totalFound = platformNames.reduce((sum, p) => sum + platforms[p].items.length, 0);
+
+if (totalFound === 0) {
+    results.innerHTML = `
+        <h2>No listings found 😔</h2>
+        <p>Try a different or shorter search term.</p>
+    `;
+} else {
+    let html = "";
+    platformNames.forEach(p => {
+        const info = platforms[p];
+        if (info.items.length === 0) return;
+        html += `<div class="platform-block">
+            <div class="platform-header">
+                <span class="platform-name">${p}</span>
+                <span class="platform-stats">${info.items.length} listings &middot; $${info.min_price} - $${info.max_price}</span>
+            </div>
+            <table>
+                <tr><th>Item</th><th>Size</th><th>Price</th><th></th></tr>`;
+        info.items.forEach(item => {
+            html += `<tr>
+                <td>${item.title}</td>
+                <td>${item.size || "n/a"}</td>
+                <td>$${item.price_usd}</td>
+                <td><a href="${item.url}" target="_blank">View</a></td>
+            </tr>`;
+        });
+        html += `</table></div>`;
+    });
+    results.innerHTML = html;
+}
+}
+</script>
+</body>
+</html>"""
+
 
 @flask_app.get("/")
-def home():
-    return render_template("index.html")
+def index():
+    return _INDEX_HTML
+
 
 @flask_app.get("/health")
 def health():
+    return jsonify({"status": "ok", "service": "thrift-grail-finder"}), 200
+
+
+@flask_app.post("/compare")
+def http_compare():
+    """
+    POST /compare
+    Body: {"prompt": "...", "sizes": [...], "max_price": 70, "min_price": 10}
+
+    Fast path: scrapes eBay/Depop/Grailed and returns raw listings grouped
+    by platform (title, price, best-effort size, url) — no Gemini vision
+    scoring, so this is much quicker than /search and doesn't need
+    GOOGLE_API_KEY at all. This is what the built-in frontend uses.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    prompt = data.get("prompt")
+    if not prompt:
+        return jsonify({"error": "prompt is required"}), 400
+
+    query = SearchQuery(
+        prompt=prompt,
+        style_tags=data.get("tags", []),
+        sizes=data.get("sizes", []),
+        max_price_usd=data.get("max_price"),
+        min_price_usd=data.get("min_price"),
+    )
+
+    grouped, scrape_debug = asyncio.run(compare_platforms(query))
+
+    platforms_out = {}
+    for platform_name, listings in grouped.items():
+        prices = [l.price_usd for l in listings]
+        platforms_out[platform_name] = {
+            "count": len(listings),
+            "min_price": min(prices) if prices else None,
+            "max_price": max(prices) if prices else None,
+            "items": [
+                {
+                    "title": l.title,
+                    "price_usd": l.price_usd,
+                    "size": l.size,
+                    "brand": l.brand,
+                    "url": str(l.url),
+                }
+                for l in listings
+            ],
+        }
+
+    warnings = []
+    if all(v["scraped"] == 0 and v["error"] is None for v in scrape_debug.values()):
+        warnings.append(
+            "All platforms returned 0 listings with no errors — the scraper selectors are likely "
+            "stale, or the sites are detecting/blocking headless Chromium on this host."
+        )
+
     return jsonify({
-        "status":"ok",
-        "service":"thrift-grail-finder"
+        "query": prompt,
+        "platforms": platforms_out,
+        "scrape_debug": scrape_debug,
+        "warnings": warnings,
     })
 
 
@@ -533,6 +818,15 @@ def http_search():
     """
     POST /search
     Body: {"prompt": "...", "tags": [...], "sizes": [...], "max_price": 70, "min_price": 10}
+
+    Slower path: scrapes AND runs Gemini vision evaluation, only returning
+    items that score above MATCH_SCORE_THRESHOLD (the "grail alert" mode —
+    this is also what triggers Telegram alerts). Use /compare instead if
+    you just want a fast price/availability comparison.
+
+    Response includes scrape_debug (per-platform scraped/kept counts + any
+    scraper error) and warnings (e.g. missing GOOGLE_API_KEY) so a silent
+    "0 results" isn't a black box.
     """
     data = request.get_json(force=True, silent=True) or {}
     prompt = data.get("prompt")
@@ -549,6 +843,9 @@ def http_search():
 
     final_state = asyncio.run(run_search(query))
     alerts = final_state.get("alerts", [])
+    listings = final_state.get("listings", [])
+    evaluations = final_state.get("evaluations", [])
+
     return jsonify({
         "alerts_found": len(alerts),
         "alerts": [
@@ -561,6 +858,10 @@ def http_search():
             }
             for a in alerts
         ],
+        "listings_found": len(listings),
+        "evaluations_count": len(evaluations),
+        "scrape_debug": final_state.get("scrape_debug", {}),
+        "warnings": final_state.get("warnings", []),
     })
 
 
