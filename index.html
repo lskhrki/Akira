@@ -6,79 +6,149 @@
         body{
             font-family:Arial,sans-serif;
             background:#f4f4f4;
-            max-width:700px;
+            max-width:800px;
             margin:auto;
             padding:40px;
         }
-
         h1{
             text-align:center;
         }
-
         input,button{
             width:100%;
             padding:12px;
             margin:10px 0;
             font-size:16px;
+            box-sizing:border-box;
         }
-
         button{
             background:#000;
             color:white;
             border:none;
             cursor:pointer;
         }
-
         #results{
             margin-top:30px;
-            white-space:pre-wrap;
+        }
+        .platform-block{
+            background:#fff;
+            border:1px solid #ddd;
+            border-radius:10px;
+            padding:15px 20px;
+            margin:15px 0;
+        }
+        .platform-header{
+            display:flex;
+            justify-content:space-between;
+            align-items:baseline;
+        }
+        .platform-name{
+            text-transform:capitalize;
+            font-size:20px;
+            font-weight:bold;
+        }
+        .platform-stats{
+            color:#555;
+            font-size:14px;
+        }
+        table{
+            width:100%;
+            border-collapse:collapse;
+            margin-top:10px;
+            font-size:14px;
+        }
+        th,td{
+            text-align:left;
+            padding:6px 4px;
+            border-bottom:1px solid #eee;
+        }
+        .debug{
+            margin-top:20px;
+            font-size:13px;
+            color:#666;
+            background:#fff;
+            border:1px solid #ddd;
+            border-radius:8px;
+            padding:12px;
+        }
+        .warning{
+            color:#b30000;
+            font-weight:bold;
         }
     </style>
 </head>
-
 <body>
-
 <h1>🧥 Thrift Grail Finder</h1>
-
 <input
 id="prompt"
-placeholder="Example: Oversized Y2K leather jacket"
+placeholder="Example: nike dunks, oversized oxford shirt"
 />
-
 <button onclick="searchItem()">
 Search
 </button>
-
 <div id="results"></div>
-
+<div id="debug" class="debug" style="display:none;"></div>
 <script>
-
 async function searchItem(){
-
 const prompt=document.getElementById("prompt").value;
+const results = document.getElementById("results");
+const debugBox = document.getElementById("debug");
+results.innerHTML = "<p>Searching Myntra, Ajio, Meesho, Amazon.in, and Flipkart... usually 10-30s.</p>";
+debugBox.style.display = "none";
 
-const response=await fetch("/search",{
-
+const response=await fetch("/compare",{
 method:"POST",
-
 headers:{
 "Content-Type":"application/json"
 },
-
 body:JSON.stringify({
 prompt:prompt
 })
-
 });
-
 const data=await response.json();
 
-document.getElementById("results").innerHTML=
-JSON.stringify(data,null,2);
-
+if (data.warnings && data.warnings.length > 0) {
+    debugBox.style.display = "block";
+    debugBox.innerHTML = "<div class='warning'>" + data.warnings.join("<br>") + "</div>";
+}
+if (data.scrape_debug) {
+    debugBox.style.display = "block";
+    debugBox.innerHTML += "<pre>" + JSON.stringify(data.scrape_debug, null, 2) + "</pre>";
 }
 
-</script>
+const platforms = data.platforms || {};
+const platformNames = Object.keys(platforms);
+const totalFound = platformNames.reduce((sum, p) => sum + platforms[p].items.length, 0);
 
+if (totalFound === 0) {
+    results.innerHTML = `
+        <h2>No listings found 😔</h2>
+        <p>Try a different or shorter search term.</p>
+    `;
+} else {
+    let html = "";
+    platformNames.forEach(p => {
+        const info = platforms[p];
+        if (info.items.length === 0) return;
+        html += `<div class="platform-block">
+            <div class="platform-header">
+                <span class="platform-name">${p}</span>
+                <span class="platform-stats">${info.items.length} listings &middot; ₹${info.min_price} - ₹${info.max_price}</span>
+            </div>
+            <table>
+                <tr><th>Item</th><th>Size</th><th>Price</th><th></th></tr>`;
+        info.items.forEach(item => {
+            html += `<tr>
+                <td>${item.title}</td>
+                <td>${item.size || "n/a"}</td>
+                <td>₹${item.price}</td>
+                <td><a href="${item.url}" target="_blank">View</a></td>
+            </tr>`;
+        });
+        html += `</table></div>`;
+    });
+    results.innerHTML = html;
+}
+}
+</script>
 </body>
 </html>

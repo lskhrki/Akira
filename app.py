@@ -1,25 +1,39 @@
 """
-The Thrift & Subculture Grail Finder — single-file version.
+The Thrift & Subculture Grail Finder.
 
-Pipeline: search resale platforms (Playwright) -> score candidates with
-Google Gemini vision -> alert on Telegram with an offer button.
+Three files, no Docker: app.py, requirements.txt, index.html (must sit next
+to app.py — it's served at "/" by reading it straight off disk).
+
+Pipeline: search Indian fashion/retail platforms (Playwright) -> score
+candidates with Google Gemini vision -> alert on Telegram with an offer
+button. The web frontend hits the faster /compare endpoint (scrape only,
+no Gemini) for a plain price/availability comparison across platforms.
+
+Platforms: Myntra, Ajio, Meesho, Amazon.in, Flipkart. All prices are INR.
+
+NOTE ON RELIABILITY: Amazon.in and Flipkart run aggressive bot-detection
+against datacenter IPs (which is what a Render server is) — expect those
+two to intermittently return 0 results or get CAPTCHA'd even when the
+scraper code itself is correct. Myntra/Ajio/Meesho are generally more
+permissive but their DOM selectors will drift over time and need upkeep —
+check scrape_debug in the API response when something returns 0 results.
 
 Run modes:
     # One-off CLI search
-    python app.py --prompt "Oversized 90s leather racing jacket, size M" \
-                   --tags y2k grunge --sizes M --max-price 70
+    python app.py --prompt "Oversized Y2K oxford shirt" --tags y2k --max-price 1500
 
     # Telegram offer-button listener only (no HTTP server)
     python app.py --bot
 
     # Web service mode (what Render's "Web Service" needs — binds to $PORT,
-    # exposes a health check + /search endpoint, and runs the Telegram bot
-    # polling loop in a background thread)
+    # serves index.html at "/", exposes /compare and /search, and runs the
+    # Telegram bot polling loop in a background thread)
     python app.py --web
 
 Env vars (put these in a .env file, see bottom of this file for the list):
     GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
-    MATCH_SCORE_THRESHOLD, MAX_PRICE_USD, ENABLE_AUTO_OFFERS, HEADLESS, PORT
+    MATCH_SCORE_THRESHOLD, MAX_PRICE_INR, ENABLE_AUTO_OFFERS, HEADLESS, PORT,
+    PLAYWRIGHT_BROWSERS_PATH (set to "0" on Render — see deploy notes below)
 """
 from __future__ import annotations
 
@@ -32,6 +46,7 @@ import re
 import threading
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import Optional, TypedDict
 
 import httpx
@@ -56,7 +71,7 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 MATCH_SCORE_THRESHOLD = int(os.getenv("MATCH_SCORE_THRESHOLD", "85"))
-MAX_PRICE_USD = float(os.getenv("MAX_PRICE_USD", "70"))
+MAX_PRICE_INR = float(os.getenv("MAX_PRICE_INR", "3000"))
 ENABLE_AUTO_OFFERS = os.getenv("ENABLE_AUTO_OFFERS", "false").lower() in {"1", "true", "yes"}
 HEADLESS = os.getenv("HEADLESS", "true").lower() in {"1", "true", "yes"}
 REQUEST_DELAY_SECONDS = float(os.getenv("REQUEST_DELAY_SECONDS", "2.0"))
@@ -66,7 +81,7 @@ if GOOGLE_API_KEY:
     genai.configure(api_key=GOOGLE_API_KEY)
 
 USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 
@@ -74,16 +89,18 @@ USER_AGENT = (
 # ============================== MODELS ===================================
 
 class Platform(str, Enum):
-    EBAY = "ebay"
-    DEPOP = "depop"
-    GRAILED = "grailed"
+    MYNTRA = "myntra"
+    AJIO = "ajio"
+    MEESHO = "meesho"
+    AMAZON = "amazon"
+    FLIPKART = "flipkart"
 
 
 class SearchQuery(BaseModel):
     prompt: str
     style_tags: list[str] = Field(default_factory=list)
-    max_price_usd: Optional[float] = None
-    min_price_usd: Optional[float] = None
+    max_price: Optional[float] = Field(default=None, description="INR")
+    min_price: Optional[float] = Field(default=None, description="INR")
     sizes: list[str] = Field(default_factory=list)
     platforms: list[Platform] = Field(default_factory=lambda: list(Platform))
 
@@ -98,7 +115,8 @@ class Listing(BaseModel):
     url: HttpUrl
     title: str
     description: str = ""
-    price_usd: float
+    price: float = Field(..., description="Price in INR")
+    currency: str = "INR"
     size: Optional[str] = None
     brand: Optional[str] = None
     photo_urls: list[HttpUrl] = Field(default_factory=list)
@@ -116,7 +134,7 @@ class EvaluationResult(BaseModel):
     flagged_defects: list[str] = Field(default_factory=list)
     counterfeit_signals: list[str] = Field(default_factory=list)
     summary: str
-    recommended_offer_usd: Optional[float] = None
+    recommended_offer: Optional[float] = Field(default=None, description="INR")
 
     def is_grail(self, threshold: int) -> bool:
         return self.match_score >= threshold and self.authenticity_confidence >= 60
@@ -131,7 +149,7 @@ class MatchAlert(BaseModel):
         lines = [
             f"🧥 *Grail Alert* — {e.match_score}% match",
             f"*{d.title}*",
-            f"💵 ${d.price_usd:.2f} | 📏 {d.size or 'n/a'} | 🏷 {d.brand or 'n/a'}",
+            f"💵 ₹{d.price:.0f} | 📏 {d.size or 'n/a'} | 🏷 {d.brand or 'n/a'}",
             f"🏪 {d.platform.value} | 🔍 authenticity {e.authenticity_confidence}%",
         ]
         if e.flagged_defects:
@@ -151,12 +169,15 @@ class GraphState(TypedDict, total=False):
 
 
 # ============================== SCRAPERS =================================
-# NOTE: DOM selectors are best-effort and will need upkeep as these sites
-# change their frontends. eBay scraping here uses the public search page;
-# swap in the official Browse API for production use.
+# NOTE: DOM selectors are best-effort as of this writing and WILL need
+# upkeep — these sites change their frontends often, and several (notably
+# Amazon/Flipkart) actively try to detect and block headless browsers.
+# Check scrape_debug in the API response when a platform returns 0 results.
 
 def _parse_price(text: str) -> Optional[float]:
-    match = re.search(r"[\d,]+\.?\d*", text.replace(",", ""))
+    """Parses Indian price formats like '₹1,299', 'Rs. 999', '₹ 2,50,000'."""
+    cleaned = text.replace("₹", "").replace("Rs.", "").replace("Rs", "").replace(",", "").strip()
+    match = re.search(r"\d+\.?\d*", cleaned)
     if not match:
         return None
     try:
@@ -165,96 +186,133 @@ def _parse_price(text: str) -> Optional[float]:
         return None
 
 
-async def _new_page(playwright):
-    browser = await playwright.chromium.launch(headless=HEADLESS)
-    context = await browser.new_context(user_agent=USER_AGENT, viewport={"width": 1366, "height": 900})
-    page = await context.new_page()
-    page.set_default_timeout(15000)  # fail fast (15s) instead of hanging on a blocked/slow site
-    return browser, context, page
-
-
 _SIZE_PATTERNS = [
     re.compile(r"\bsize\s*[:\-]?\s*([a-zA-Z0-9\.]{1,4})\b", re.IGNORECASE),
-    re.compile(r"\bus\s?(\d{1,2}(?:\.\d)?)\b", re.IGNORECASE),
-    re.compile(r"\b(\d{1,2}(?:\.\d)?)\s?(?:us|uk|eu)\b", re.IGNORECASE),
     re.compile(r"\b(xxs|xs|s|m|l|xl|xxl|xxxl)\b", re.IGNORECASE),
+    re.compile(r"\b(uk|eu|us)\s?(\d{1,2}(?:\.\d)?)\b", re.IGNORECASE),
 ]
 
 
 def _guess_size_from_text(text: str) -> Optional[str]:
-    """Best-effort size extraction from a listing title/description.
-    eBay and Depop search cards don't expose structured size data — only
-    Grailed does — so this is a fallback, not a guarantee."""
+    """Best-effort size extraction from a listing title — most of these
+    search-result cards don't expose structured size data."""
     for pattern in _SIZE_PATTERNS:
         match = pattern.search(text)
         if match:
-            return match.group(1).upper()
+            return match.group(match.lastindex).upper()
     return None
 
 
-async def scrape_ebay(query: SearchQuery, max_results: int = 15) -> tuple[list[Listing], Optional[str]]:
-    """Returns (listings, error_message). error_message is None on success,
-    even if zero listings were found (that's a selector/blocking issue, not
-    a hard failure) — check both fields to tell the two cases apart."""
+async def _new_page(playwright):
+    browser = await playwright.chromium.launch(headless=HEADLESS)
+    context = await browser.new_context(
+        user_agent=USER_AGENT,
+        viewport={"width": 1366, "height": 900},
+        locale="en-IN",
+    )
+    page = await context.new_page()
+    page.set_default_timeout(15000)  # fail fast instead of hanging on a blocked/slow site
+    return browser, context, page
+
+
+async def scrape_myntra(query: SearchQuery, max_results: int = 15) -> tuple[list[Listing], Optional[str]]:
     listings: list[Listing] = []
     try:
         async with async_playwright() as pw:
             browser, context, page = await _new_page(pw)
-            url = f"https://www.ebay.com/sch/i.html?_nkw={query.search_terms().replace(' ', '+')}"
+            search_slug = query.search_terms().strip().replace(" ", "-")
+            url = f"https://www.myntra.com/{search_slug}"
             await page.goto(url, wait_until="domcontentloaded")
             await asyncio.sleep(REQUEST_DELAY_SECONDS)
-            cards = await page.locator("li.s-item").all()
+            cards = await page.locator("li.product-base").all()
             for card in cards[:max_results]:
                 try:
-                    title = (await card.locator(".s-item__title").inner_text()).strip()
-                    link = await card.locator("a.s-item__link").get_attribute("href")
-                    price = _parse_price((await card.locator(".s-item__price").inner_text()).strip())
-                    img = await card.locator("img.s-item__image-img").get_attribute("src")
-                    if not link or "ebay.com/itm" not in link or price is None:
+                    brand = (await card.locator(".product-brand").inner_text()).strip()
+                    name = (await card.locator(".product-product").inner_text()).strip()
+                    price_text = (await card.locator(".product-discountedPrice, .product-price").first.inner_text()).strip()
+                    price = _parse_price(price_text)
+                    href = await card.locator("a").first.get_attribute("href")
+                    img = await card.locator("img").first.get_attribute("src")
+                    if price is None or not href:
                         continue
+                    full_url = href if href.startswith("http") else f"https://www.myntra.com/{href.lstrip('/')}"
                     listings.append(Listing(
-                        platform=Platform.EBAY,
-                        listing_id=link.split("/itm/")[-1].split("?")[0],
-                        url=link, title=title, price_usd=price,
-                        photo_urls=[img] if img else [],
+                        platform=Platform.MYNTRA,
+                        listing_id=full_url.rstrip("/").split("/")[-1],
+                        url=full_url, title=f"{brand} {name}".strip(), brand=brand or None,
+                        price=price, photo_urls=[img] if img else [],
                     ))
                 except Exception:
                     continue
             await context.close()
             await browser.close()
     except Exception as exc:
-        logger.exception("eBay scrape failed")
+        logger.exception("Myntra scrape failed")
         return listings, f"{exc.__class__.__name__}: {exc}"
     return listings, None
 
 
-async def scrape_depop(query: SearchQuery, max_results: int = 15) -> tuple[list[Listing], Optional[str]]:
+async def scrape_ajio(query: SearchQuery, max_results: int = 15) -> tuple[list[Listing], Optional[str]]:
     listings: list[Listing] = []
     try:
         async with async_playwright() as pw:
             browser, context, page = await _new_page(pw)
-            url = f"https://www.depop.com/search/?q={query.search_terms().replace(' ', '%20')}"
+            url = f"https://www.ajio.com/search/?text={query.search_terms().replace(' ', '%20')}"
             await page.goto(url, wait_until="domcontentloaded")
             await asyncio.sleep(REQUEST_DELAY_SECONDS)
-            for _ in range(3):
-                await page.mouse.wheel(0, 2000)
-                await page.wait_for_timeout(600)
-            cards = await page.locator("[data-testid='product-card'], a[href^='/products/']").all()
+            cards = await page.locator(".item, .rilrtl-products-list__item").all()
+            for card in cards[:max_results]:
+                try:
+                    brand = await _safe_text(card, ".brand")
+                    name = await _safe_text(card, ".nameCls")
+                    price_text = await _safe_text(card, ".price strong, .price")
+                    price = _parse_price(price_text) if price_text else None
+                    href = await card.locator("a").first.get_attribute("href")
+                    img = await card.locator("img").first.get_attribute("src")
+                    if price is None or not href:
+                        continue
+                    full_url = href if href.startswith("http") else f"https://www.ajio.com{href}"
+                    listings.append(Listing(
+                        platform=Platform.AJIO,
+                        listing_id=full_url.rstrip("/").split("/")[-1],
+                        url=full_url, title=f"{brand or ''} {name or query.search_terms()}".strip(),
+                        brand=brand, price=price, photo_urls=[img] if img else [],
+                    ))
+                except Exception:
+                    continue
+            await context.close()
+            await browser.close()
+    except Exception as exc:
+        logger.exception("Ajio scrape failed")
+        return listings, f"{exc.__class__.__name__}: {exc}"
+    return listings, None
+
+
+async def scrape_meesho(query: SearchQuery, max_results: int = 15) -> tuple[list[Listing], Optional[str]]:
+    listings: list[Listing] = []
+    try:
+        async with async_playwright() as pw:
+            browser, context, page = await _new_page(pw)
+            url = f"https://www.meesho.com/search?q={query.search_terms().replace(' ', '%20')}"
+            await page.goto(url, wait_until="domcontentloaded")
+            await asyncio.sleep(REQUEST_DELAY_SECONDS + 1)  # Meesho is a heavier client-side app
+            cards = await page.locator("[class*='ProductList'] a, a[href*='/product/']").all()
             for card in cards[:max_results]:
                 try:
                     href = await card.get_attribute("href")
                     if not href:
                         continue
-                    full_url = href if href.startswith("http") else f"https://www.depop.com{href}"
-                    price_el = card.locator("[data-testid='product-price'], [aria-label*='price']").first
-                    price = _parse_price(await price_el.inner_text()) if await price_el.count() else None
+                    full_url = href if href.startswith("http") else f"https://www.meesho.com{href}"
+                    text_blob = (await card.inner_text()).strip()
+                    price = _parse_price(text_blob)
                     img = await card.locator("img").first.get_attribute("src")
                     if price is None:
                         continue
+                    title_line = text_blob.split("\n")[0][:120] if text_blob else query.search_terms()
                     listings.append(Listing(
-                        platform=Platform.DEPOP,
+                        platform=Platform.MEESHO,
                         listing_id=full_url.rstrip("/").split("/")[-1],
-                        url=full_url, title=query.search_terms(), price_usd=price,
+                        url=full_url, title=title_line, price=price,
                         photo_urls=[img] if img else [],
                     ))
                 except Exception:
@@ -262,35 +320,36 @@ async def scrape_depop(query: SearchQuery, max_results: int = 15) -> tuple[list[
             await context.close()
             await browser.close()
     except Exception as exc:
-        logger.exception("Depop scrape failed")
+        logger.exception("Meesho scrape failed")
         return listings, f"{exc.__class__.__name__}: {exc}"
     return listings, None
 
 
-async def scrape_grailed(query: SearchQuery, max_results: int = 15) -> tuple[list[Listing], Optional[str]]:
+async def scrape_amazon(query: SearchQuery, max_results: int = 15) -> tuple[list[Listing], Optional[str]]:
     listings: list[Listing] = []
     try:
         async with async_playwright() as pw:
             browser, context, page = await _new_page(pw)
-            url = f"https://www.grailed.com/shop?query={query.search_terms().replace(' ', '+')}"
+            url = f"https://www.amazon.in/s?k={query.search_terms().replace(' ', '+')}"
             await page.goto(url, wait_until="domcontentloaded")
             await asyncio.sleep(REQUEST_DELAY_SECONDS)
-            cards = await page.locator("div.feed-item, a.listing-item-link").all()
+            cards = await page.locator("div[data-component-type='s-search-result']").all()
             for card in cards[:max_results]:
                 try:
-                    href = await card.get_attribute("href") or await card.locator("a").first.get_attribute("href")
-                    if not href:
+                    title = await _safe_text(card, "h2 a span, h2 span")
+                    price_whole = await _safe_text(card, ".a-price-whole")
+                    price = _parse_price(price_whole) if price_whole else None
+                    href = await card.locator("h2 a").first.get_attribute("href")
+                    img = await card.locator("img.s-image").first.get_attribute("src")
+                    if price is None or not href or not title:
                         continue
-                    full_url = href if href.startswith("http") else f"https://www.grailed.com{href}"
-                    price_el = card.locator(".sub-title, .ListingMetadata-module__price").first
-                    price = _parse_price(await price_el.inner_text()) if await price_el.count() else None
-                    img = await card.locator("img").first.get_attribute("src")
-                    if price is None:
-                        continue
+                    full_url = href if href.startswith("http") else f"https://www.amazon.in{href}"
+                    asin_match = re.search(r"/dp/([A-Z0-9]{10})", full_url)
+                    listing_id = asin_match.group(1) if asin_match else full_url.rstrip("/").split("/")[-1]
                     listings.append(Listing(
-                        platform=Platform.GRAILED,
-                        listing_id=full_url.rstrip("/").split("/")[-1],
-                        url=full_url, title=query.search_terms(), price_usd=price,
+                        platform=Platform.AMAZON,
+                        listing_id=listing_id,
+                        url=full_url, title=title, price=price,
                         photo_urls=[img] if img else [],
                     ))
                 except Exception:
@@ -298,12 +357,68 @@ async def scrape_grailed(query: SearchQuery, max_results: int = 15) -> tuple[lis
             await context.close()
             await browser.close()
     except Exception as exc:
-        logger.exception("Grailed scrape failed")
+        logger.exception("Amazon scrape failed (likely bot-blocked — Amazon is aggressive against datacenter IPs)")
         return listings, f"{exc.__class__.__name__}: {exc}"
     return listings, None
 
 
-SCRAPERS = {Platform.EBAY: scrape_ebay, Platform.DEPOP: scrape_depop, Platform.GRAILED: scrape_grailed}
+async def scrape_flipkart(query: SearchQuery, max_results: int = 15) -> tuple[list[Listing], Optional[str]]:
+    listings: list[Listing] = []
+    try:
+        async with async_playwright() as pw:
+            browser, context, page = await _new_page(pw)
+            url = f"https://www.flipkart.com/search?q={query.search_terms().replace(' ', '%20')}"
+            await page.goto(url, wait_until="domcontentloaded")
+            await asyncio.sleep(REQUEST_DELAY_SECONDS)
+            # Flipkart shows a login modal on most page loads; dismiss it if present.
+            try:
+                await page.locator("button:has-text('✕')").first.click(timeout=2000)
+            except Exception:
+                pass
+            cards = await page.locator("div._1AtVbE, div._4rR01T, a.s1Q9rs").all()
+            for card in cards[:max_results]:
+                try:
+                    title = await _safe_text(card, "._4rR01T, .s1Q9rs, a") or (await card.get_attribute("title"))
+                    price_text = await _safe_text(card, "._30jeq3")
+                    price = _parse_price(price_text) if price_text else None
+                    href = await card.locator("a").first.get_attribute("href") if await card.locator("a").count() else await card.get_attribute("href")
+                    img = await card.locator("img").first.get_attribute("src") if await card.locator("img").count() else None
+                    if price is None or not href or not title:
+                        continue
+                    full_url = href if href.startswith("http") else f"https://www.flipkart.com{href}"
+                    listings.append(Listing(
+                        platform=Platform.FLIPKART,
+                        listing_id=full_url.split("pid=")[-1].split("&")[0] if "pid=" in full_url else full_url.rstrip("/").split("/")[-1],
+                        url=full_url, title=title.strip(), price=price,
+                        photo_urls=[img] if img else [],
+                    ))
+                except Exception:
+                    continue
+            await context.close()
+            await browser.close()
+    except Exception as exc:
+        logger.exception("Flipkart scrape failed")
+        return listings, f"{exc.__class__.__name__}: {exc}"
+    return listings, None
+
+
+async def _safe_text(locator, selector: str) -> Optional[str]:
+    try:
+        el = locator.locator(selector).first
+        if await el.count() == 0:
+            return None
+        return (await el.inner_text()).strip()
+    except Exception:
+        return None
+
+
+SCRAPERS = {
+    Platform.MYNTRA: scrape_myntra,
+    Platform.AJIO: scrape_ajio,
+    Platform.MEESHO: scrape_meesho,
+    Platform.AMAZON: scrape_amazon,
+    Platform.FLIPKART: scrape_flipkart,
+}
 
 
 def _apply_size_guess(listing: Listing) -> Listing:
@@ -314,8 +429,8 @@ def _apply_size_guess(listing: Listing) -> Listing:
 
 async def compare_platforms(query: SearchQuery) -> tuple[dict[str, list[Listing]], dict]:
     """Fast path: scrape only, no vision evaluation. Returns listings grouped
-    by platform (for a price/availability comparison view) plus the same
-    scrape_debug diagnostics as gather_candidates."""
+    by platform (for a price/availability comparison view) plus per-platform
+    scrape/error diagnostics."""
     platforms = query.platforms or list(SCRAPERS.keys())
     results = await asyncio.gather(*(SCRAPERS[p](query) for p in platforms))
 
@@ -324,9 +439,9 @@ async def compare_platforms(query: SearchQuery) -> tuple[dict[str, list[Listing]
     for platform, (group, error) in zip(platforms, results):
         filtered = []
         for listing in group:
-            if query.max_price_usd and listing.price_usd > query.max_price_usd:
+            if query.max_price and listing.price > query.max_price:
                 continue
-            if query.min_price_usd and listing.price_usd < query.min_price_usd:
+            if query.min_price and listing.price < query.min_price:
                 continue
             filtered.append(_apply_size_guess(listing))
         grouped[platform.value] = filtered
@@ -336,9 +451,9 @@ async def compare_platforms(query: SearchQuery) -> tuple[dict[str, list[Listing]
 
 
 async def gather_candidates(query: SearchQuery) -> tuple[list[Listing], dict]:
-    """Returns (merged_listings, debug_info). debug_info has one entry per
-    platform: {"found": N, "error": str|None} so failures are visible
-    instead of silently producing zero results."""
+    """Returns (merged_listings, debug_info) — same scraping as
+    compare_platforms but flattened + deduped for the vision-evaluation
+    pipeline in /search."""
     platforms = query.platforms or list(SCRAPERS.keys())
     results = await asyncio.gather(*(SCRAPERS[p](query) for p in platforms))
 
@@ -351,12 +466,12 @@ async def gather_candidates(query: SearchQuery) -> tuple[list[Listing], dict]:
             key = listing.unique_key()
             if key in seen:
                 continue
-            if query.max_price_usd and listing.price_usd > query.max_price_usd:
+            if query.max_price and listing.price > query.max_price:
                 continue
-            if query.min_price_usd and listing.price_usd < query.min_price_usd:
+            if query.min_price and listing.price < query.min_price:
                 continue
             seen.add(key)
-            merged.append(listing)
+            merged.append(_apply_size_guess(listing))
             kept_count += 1
         debug_info[platform.value] = {"scraped": raw_count, "kept_after_filters": kept_count, "error": error}
 
@@ -366,20 +481,24 @@ async def gather_candidates(query: SearchQuery) -> tuple[list[Listing], dict]:
 
 # ============================== EVALUATOR (Gemini) =========================
 
-_SYSTEM_PROMPT = """You are an expert vintage/streetwear authenticator and \
-resale buyer for Gen Z secondhand fashion. Given a buyer's request and a \
+_SYSTEM_PROMPT = """You are an expert fashion buyer evaluating listings from \
+Indian retail platforms (Myntra, Ajio, Meesho, Amazon.in, Flipkart) for a \
+buyer. All prices are in Indian Rupees (INR). Given a buyer's request and a \
 candidate listing (title, description, price, photos), evaluate:
 1. match_score (0-100): fit vs. the buyer's request (style, era, silhouette, price).
-2. authenticity_confidence (0-100): likelihood this is genuine vs. a replica.
-3. condition_score (0-100): physical condition visible in photos.
+2. authenticity_confidence (0-100): likelihood this is genuine vs. a replica \
+   or mislabeled product (this matters especially on marketplace platforms \
+   like Meesho/Amazon/Flipkart where third-party sellers list items).
+3. condition_score (0-100): physical condition visible in photos, if a used/preloved item.
 4. flagged_defects: short list of visible issues, if any.
 5. counterfeit_signals: short list of reasons to doubt authenticity, if any.
 6. summary: one or two sentence verdict.
-7. recommended_offer_usd: a fair lowball offer below asking, or null if already a steal.
+7. recommended_offer: a fair lower price in INR if the platform supports \
+   negotiation, or null if the listed price is already fair/fixed.
 
 Respond with ONLY a JSON object with exactly these keys: match_score, \
 authenticity_confidence, condition_score, flagged_defects, \
-counterfeit_signals, summary, recommended_offer_usd. No markdown, no \
+counterfeit_signals, summary, recommended_offer. No markdown, no \
 commentary, no code fences."""
 
 
@@ -399,9 +518,10 @@ async def evaluate_listing(query: SearchQuery, listing: Listing) -> Optional[Eva
 
     text_prompt = (
         f"Buyer request: {query.prompt}\nStyle tags: {', '.join(query.style_tags) or 'none'}\n"
-        f"Max price: {query.max_price_usd or 'no limit'}\n\n"
+        f"Max price: ₹{query.max_price or 'no limit'}\n\n"
         f"Listing title: {listing.title}\nDescription: {listing.description or 'n/a'}\n"
-        f"Price: ${listing.price_usd:.2f}\nBrand: {listing.brand or 'n/a'}\nSize: {listing.size or 'n/a'}"
+        f"Price: ₹{listing.price:.0f}\nPlatform: {listing.platform.value}\n"
+        f"Brand: {listing.brand or 'n/a'}\nSize: {listing.size or 'n/a'}"
     )
 
     async with httpx.AsyncClient() as client:
@@ -479,37 +599,17 @@ async def send_alert(alert: MatchAlert) -> None:
 
 async def submit_offer(alert: MatchAlert) -> str:
     listing = alert.listing
-    suggested = alert.evaluation.recommended_offer_usd or round(listing.price_usd * 0.85, 2)
-    offer_amount = min(suggested, MAX_PRICE_USD) if MAX_PRICE_USD else suggested
+    suggested = alert.evaluation.recommended_offer or round(listing.price * 0.85, 2)
+    offer_amount = min(suggested, MAX_PRICE_INR) if MAX_PRICE_INR else suggested
 
     if not ENABLE_AUTO_OFFERS:
-        return f"🧪 DRY RUN (set ENABLE_AUTO_OFFERS=true to go live): would offer ${offer_amount:.2f} on {listing.title} ({listing.url})"
+        return f"🧪 DRY RUN (set ENABLE_AUTO_OFFERS=true to go live): would offer ₹{offer_amount:.0f} on {listing.title} ({listing.url})"
 
-    try:
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=HEADLESS)
-            context = await browser.new_context()
-            page = await context.new_page()
-            await page.goto(str(listing.url), wait_until="domcontentloaded")
-
-            if listing.platform == Platform.DEPOP:
-                await page.get_by_role("button", name="Make offer").click(timeout=5000)
-                await page.get_by_role("textbox").fill(str(int(offer_amount)))
-                await page.get_by_role("button", name="Send offer").click(timeout=5000)
-            elif listing.platform == Platform.GRAILED:
-                await page.get_by_role("button", name="Offer").click(timeout=5000)
-                await page.get_by_role("textbox").fill(str(int(offer_amount)))
-                await page.get_by_role("button", name="Submit").click(timeout=5000)
-            else:
-                await browser.close()
-                return f"⚠️ Auto-offer not implemented for {listing.platform.value}: {listing.url}"
-
-            await context.close()
-            await browser.close()
-            return f"✅ Offer of ${offer_amount:.2f} submitted on {listing.platform.value}."
-    except Exception as exc:
-        logger.exception("Offer submission failed")
-        return f"❌ Offer automation failed ({exc.__class__.__name__}) — go offer manually: {listing.url}"
+    # Most Indian retail platforms (Myntra/Ajio/Amazon/Flipkart) are fixed-price
+    # and don't support buyer-initiated offers at all — Meesho sellers
+    # sometimes negotiate via chat, but there's no public offer API/UI flow
+    # to automate reliably. This is left as a manual step by design.
+    return f"⚠️ These platforms don't support automated offers — go negotiate/purchase manually: {listing.url}"
 
 
 async def _handle_offer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -520,7 +620,7 @@ async def _handle_offer_callback(update: Update, context: ContextTypes.DEFAULT_T
     if alert is None:
         await query.edit_message_text("This listing expired from memory — search again to refresh it.")
         return
-    await query.message.reply_text("⏳ Submitting offer...")
+    await query.message.reply_text("⏳ Checking offer options...")
     result = await submit_offer(alert)
     await query.message.reply_text(result)
 
@@ -580,172 +680,27 @@ async def run_search(query: SearchQuery) -> GraphState:
 # ============================== WEB SERVER (Render Web Service) ============
 #
 # Render's "Web Service" type requires something bound to $PORT that answers
-# HTTP requests, or the deploy fails. This gives it that: a tiny Flask app
-# with a health check + a /search endpoint, while the Telegram offer-button
-# listener runs continuously in a background thread alongside it.
+# HTTP requests, or the deploy fails. This gives it that: index.html served
+# at "/", plus a health check + /compare + /search, while the Telegram
+# offer-button listener runs continuously in a background thread alongside it.
 
 flask_app = Flask(__name__)
 
-# Your frontend. Served directly at "/" so Render's URL opens straight into it.
-_INDEX_HTML = """<!DOCTYPE html>
-<html>
-<head>
-    <title>Thrift Grail Finder</title>
-    <style>
-        body{
-            font-family:Arial,sans-serif;
-            background:#f4f4f4;
-            max-width:800px;
-            margin:auto;
-            padding:40px;
-        }
-        h1{
-            text-align:center;
-        }
-        input,button{
-            width:100%;
-            padding:12px;
-            margin:10px 0;
-            font-size:16px;
-            box-sizing:border-box;
-        }
-        button{
-            background:#000;
-            color:white;
-            border:none;
-            cursor:pointer;
-        }
-        #results{
-            margin-top:30px;
-        }
-        .platform-block{
-            background:#fff;
-            border:1px solid #ddd;
-            border-radius:10px;
-            padding:15px 20px;
-            margin:15px 0;
-        }
-        .platform-header{
-            display:flex;
-            justify-content:space-between;
-            align-items:baseline;
-        }
-        .platform-name{
-            text-transform:capitalize;
-            font-size:20px;
-            font-weight:bold;
-        }
-        .platform-stats{
-            color:#555;
-            font-size:14px;
-        }
-        table{
-            width:100%;
-            border-collapse:collapse;
-            margin-top:10px;
-            font-size:14px;
-        }
-        th,td{
-            text-align:left;
-            padding:6px 4px;
-            border-bottom:1px solid #eee;
-        }
-        .debug{
-            margin-top:20px;
-            font-size:13px;
-            color:#666;
-            background:#fff;
-            border:1px solid #ddd;
-            border-radius:8px;
-            padding:12px;
-        }
-        .warning{
-            color:#b30000;
-            font-weight:bold;
-        }
-    </style>
-</head>
-<body>
-<h1>🧥 Thrift Grail Finder</h1>
-<input
-id="prompt"
-placeholder="Example: nike dunks"
-/>
-<button onclick="searchItem()">
-Search
-</button>
-<div id="results"></div>
-<div id="debug" class="debug" style="display:none;"></div>
-<script>
-async function searchItem(){
-const prompt=document.getElementById("prompt").value;
-const results = document.getElementById("results");
-const debugBox = document.getElementById("debug");
-results.innerHTML = "<p>Searching eBay, Depop, and Grailed... usually 5-20s.</p>";
-debugBox.style.display = "none";
+# Frontend lives in index.html, next to this file — read fresh each request
+# so you can edit index.html without restarting the server.
+_INDEX_HTML_PATH = Path(__file__).parent / "index.html"
 
-const response=await fetch("/compare",{
-method:"POST",
-headers:{
-"Content-Type":"application/json"
-},
-body:JSON.stringify({
-prompt:prompt
-})
-});
-const data=await response.json();
 
-if (data.warnings && data.warnings.length > 0) {
-    debugBox.style.display = "block";
-    debugBox.innerHTML = "<div class='warning'>" + data.warnings.join("<br>") + "</div>";
-}
-if (data.scrape_debug) {
-    debugBox.style.display = "block";
-    debugBox.innerHTML += "<pre>" + JSON.stringify(data.scrape_debug, null, 2) + "</pre>";
-}
-
-const platforms = data.platforms || {};
-const platformNames = Object.keys(platforms);
-const totalFound = platformNames.reduce((sum, p) => sum + platforms[p].items.length, 0);
-
-if (totalFound === 0) {
-    results.innerHTML = `
-        <h2>No listings found 😔</h2>
-        <p>Try a different or shorter search term.</p>
-    `;
-} else {
-    let html = "";
-    platformNames.forEach(p => {
-        const info = platforms[p];
-        if (info.items.length === 0) return;
-        html += `<div class="platform-block">
-            <div class="platform-header">
-                <span class="platform-name">${p}</span>
-                <span class="platform-stats">${info.items.length} listings &middot; $${info.min_price} - $${info.max_price}</span>
-            </div>
-            <table>
-                <tr><th>Item</th><th>Size</th><th>Price</th><th></th></tr>`;
-        info.items.forEach(item => {
-            html += `<tr>
-                <td>${item.title}</td>
-                <td>${item.size || "n/a"}</td>
-                <td>$${item.price_usd}</td>
-                <td><a href="${item.url}" target="_blank">View</a></td>
-            </tr>`;
-        });
-        html += `</table></div>`;
-    });
-    results.innerHTML = html;
-}
-}
-</script>
-</body>
-</html>"""
+def _load_index_html() -> str:
+    try:
+        return _INDEX_HTML_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return "<h1>index.html not found</h1><p>Make sure index.html sits next to app.py.</p>"
 
 
 @flask_app.get("/")
 def index():
-    return _INDEX_HTML
+    return _load_index_html()
 
 
 @flask_app.get("/health")
@@ -757,12 +712,13 @@ def health():
 def http_compare():
     """
     POST /compare
-    Body: {"prompt": "...", "sizes": [...], "max_price": 70, "min_price": 10}
+    Body: {"prompt": "...", "sizes": [...], "max_price": 3000, "min_price": 500}
+    (max_price/min_price are in INR)
 
-    Fast path: scrapes eBay/Depop/Grailed and returns raw listings grouped
-    by platform (title, price, best-effort size, url) — no Gemini vision
-    scoring, so this is much quicker than /search and doesn't need
-    GOOGLE_API_KEY at all. This is what the built-in frontend uses.
+    Fast path: scrapes Myntra/Ajio/Meesho/Amazon.in/Flipkart and returns raw
+    listings grouped by platform (title, price in INR, best-effort size,
+    url) — no Gemini vision scoring, so this is much quicker than /search
+    and doesn't need GOOGLE_API_KEY at all. This is what the frontend uses.
     """
     data = request.get_json(force=True, silent=True) or {}
     prompt = data.get("prompt")
@@ -773,15 +729,15 @@ def http_compare():
         prompt=prompt,
         style_tags=data.get("tags", []),
         sizes=data.get("sizes", []),
-        max_price_usd=data.get("max_price"),
-        min_price_usd=data.get("min_price"),
+        max_price=data.get("max_price"),
+        min_price=data.get("min_price"),
     )
 
     grouped, scrape_debug = asyncio.run(compare_platforms(query))
 
     platforms_out = {}
     for platform_name, listings in grouped.items():
-        prices = [l.price_usd for l in listings]
+        prices = [l.price for l in listings]
         platforms_out[platform_name] = {
             "count": len(listings),
             "min_price": min(prices) if prices else None,
@@ -789,7 +745,8 @@ def http_compare():
             "items": [
                 {
                     "title": l.title,
-                    "price_usd": l.price_usd,
+                    "price": l.price,
+                    "currency": l.currency,
                     "size": l.size,
                     "brand": l.brand,
                     "url": str(l.url),
@@ -804,6 +761,12 @@ def http_compare():
             "All platforms returned 0 listings with no errors — the scraper selectors are likely "
             "stale, or the sites are detecting/blocking headless Chromium on this host."
         )
+    blocked = [p for p, v in scrape_debug.items() if v["error"] and p in ("amazon", "flipkart")]
+    if blocked:
+        warnings.append(
+            f"{', '.join(blocked)} failed — Amazon/Flipkart frequently block datacenter IPs like Render's; "
+            "this can happen even when the scraper code is correct."
+        )
 
     return jsonify({
         "query": prompt,
@@ -817,16 +780,13 @@ def http_compare():
 def http_search():
     """
     POST /search
-    Body: {"prompt": "...", "tags": [...], "sizes": [...], "max_price": 70, "min_price": 10}
+    Body: {"prompt": "...", "tags": [...], "sizes": [...], "max_price": 3000, "min_price": 500}
+    (prices in INR)
 
     Slower path: scrapes AND runs Gemini vision evaluation, only returning
     items that score above MATCH_SCORE_THRESHOLD (the "grail alert" mode —
     this is also what triggers Telegram alerts). Use /compare instead if
     you just want a fast price/availability comparison.
-
-    Response includes scrape_debug (per-platform scraped/kept counts + any
-    scraper error) and warnings (e.g. missing GOOGLE_API_KEY) so a silent
-    "0 results" isn't a black box.
     """
     data = request.get_json(force=True, silent=True) or {}
     prompt = data.get("prompt")
@@ -837,8 +797,8 @@ def http_search():
         prompt=prompt,
         style_tags=data.get("tags", []),
         sizes=data.get("sizes", []),
-        max_price_usd=data.get("max_price"),
-        min_price_usd=data.get("min_price"),
+        max_price=data.get("max_price"),
+        min_price=data.get("min_price"),
     )
 
     final_state = asyncio.run(run_search(query))
@@ -851,7 +811,7 @@ def http_search():
         "alerts": [
             {
                 "title": a.listing.title,
-                "price_usd": a.listing.price_usd,
+                "price": a.listing.price,
                 "url": str(a.listing.url),
                 "match_score": a.evaluation.match_score,
                 "authenticity_confidence": a.evaluation.authenticity_confidence,
@@ -885,7 +845,7 @@ def _start_bot_polling_in_background() -> None:
 def run_web_service() -> None:
     port = int(os.environ.get("PORT", "10000"))  # Render sets $PORT for you
     if not GOOGLE_API_KEY:
-        logger.warning("GOOGLE_API_KEY not set — evaluation step will fail on /search.")
+        logger.warning("GOOGLE_API_KEY not set — /search evaluation step will fail (but /compare still works).")
     _start_bot_polling_in_background()
     logger.info("Starting web service on 0.0.0.0:%d", port)
     flask_app.run(host="0.0.0.0", port=port)
@@ -898,10 +858,10 @@ def _parse_args():
     parser.add_argument("--prompt", help="Free-text description of the item/vibe you want.")
     parser.add_argument("--tags", nargs="*", default=[])
     parser.add_argument("--sizes", nargs="*", default=[])
-    parser.add_argument("--max-price", type=float, default=None)
-    parser.add_argument("--min-price", type=float, default=None)
+    parser.add_argument("--max-price", type=float, default=None, help="INR")
+    parser.add_argument("--min-price", type=float, default=None, help="INR")
     parser.add_argument("--bot", action="store_true", help="Run only the Telegram offer-button listener (no HTTP server).")
-    parser.add_argument("--web", action="store_true", help="Run as a web service: health check + /search endpoint, with the Telegram bot polling in the background. Use this on Render.")
+    parser.add_argument("--web", action="store_true", help="Run as a web service: index.html + /compare + /search, with the Telegram bot polling in the background. Use this on Render.")
     return parser.parse_args()
 
 
@@ -913,7 +873,7 @@ async def _run_cli_search(args) -> None:
 
     query = SearchQuery(
         prompt=args.prompt, style_tags=args.tags, sizes=args.sizes,
-        max_price_usd=args.max_price, min_price_usd=args.min_price,
+        max_price=args.max_price, min_price=args.min_price,
     )
     final_state = await run_search(query)
 
@@ -921,7 +881,7 @@ async def _run_cli_search(args) -> None:
     if not alerts:
         logger.info("No grails found above the %d%% threshold this run.", MATCH_SCORE_THRESHOLD)
     for alert in alerts:
-        logger.info("MATCH %d%% — %s — $%.2f — %s", alert.evaluation.match_score, alert.listing.title, alert.listing.price_usd, alert.listing.url)
+        logger.info("MATCH %d%% — %s — ₹%.0f — %s", alert.evaluation.match_score, alert.listing.title, alert.listing.price, alert.listing.url)
 
 
 def main() -> None:
@@ -953,9 +913,15 @@ if __name__ == "__main__":
 # TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
 # TELEGRAM_CHAT_ID=123456789
 # MATCH_SCORE_THRESHOLD=85
-# MAX_PRICE_USD=70
+# MAX_PRICE_INR=3000
 # ENABLE_AUTO_OFFERS=false
 # HEADLESS=true
 # REQUEST_DELAY_SECONDS=2.0
 # PORT=10000
 # (Render sets PORT for you automatically — you don't need to set it manually there.)
+#
+# On Render specifically, also set:
+# PLAYWRIGHT_BROWSERS_PATH=0
+# (forces the Chromium install to live inside site-packages instead of
+# ~/.cache, which is what reliably persists from Render's build step into
+# the runtime container — see the Build Command note in the project README.)
