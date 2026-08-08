@@ -70,6 +70,15 @@
             border-radius:8px;
             padding:12px;
         }
+        .view-button{
+            display:inline-block;
+            background:#000;
+            color:#fff;
+            padding:10px 16px;
+            border-radius:6px;
+            text-decoration:none;
+            margin-top:8px;
+        }
         .warning{
             color:#b30000;
             font-weight:bold;
@@ -89,66 +98,112 @@ Search
 <div id="debug" class="debug" style="display:none;"></div>
 <script>
 async function searchItem(){
-const prompt=document.getElementById("prompt").value;
-const results = document.getElementById("results");
-const debugBox = document.getElementById("debug");
-results.innerHTML = "<p>Searching Myntra, Ajio, Meesho, Amazon.in, and Flipkart... usually 10-30s.</p>";
-debugBox.style.display = "none";
+    const prompt = document.getElementById("prompt").value.trim();
+    const results = document.getElementById("results");
+    const debugBox = document.getElementById("debug");
 
-const response=await fetch("/compare",{
-method:"POST",
-headers:{
-"Content-Type":"application/json"
-},
-body:JSON.stringify({
-prompt:prompt
-})
-});
-const data=await response.json();
+    if (!prompt) {
+        results.innerHTML = "<p>Please enter something to search.</p>";
+        return;
+    }
 
-if (data.warnings && data.warnings.length > 0) {
-    debugBox.style.display = "block";
-    debugBox.innerHTML = "<div class='warning'>" + data.warnings.join("<br>") + "</div>";
-}
-if (data.scrape_debug) {
-    debugBox.style.display = "block";
-    debugBox.innerHTML += "<pre>" + JSON.stringify(data.scrape_debug, null, 2) + "</pre>";
-}
+    const q = encodeURIComponent(prompt);
 
-const platforms = data.platforms || {};
-const platformNames = Object.keys(platforms);
-const totalFound = platformNames.reduce((sum, p) => sum + platforms[p].items.length, 0);
-
-if (totalFound === 0) {
     results.innerHTML = `
-        <h2>No listings found 😔</h2>
-        <p>Try a different or shorter search term.</p>
+        <h2>Best places to find "${escapeHtml(prompt)}"</h2>
+
+        <div class="platform-block">
+            <div class="platform-header"><span class="platform-name">Myntra</span><span class="platform-stats">Live search</span></div>
+            <p>Find matching products on Myntra.</p>
+            <a class="view-button" href="https://www.myntra.com/${q.replace(/%20/g, "-")}" target="_blank">View Myntra Results</a>
+        </div>
+
+        <div class="platform-block">
+            <div class="platform-header"><span class="platform-name">AJIO</span><span class="platform-stats">Live search</span></div>
+            <p>Find matching products on AJIO.</p>
+            <a class="view-button" href="https://www.ajio.com/search/?text=${q}" target="_blank">View AJIO Results</a>
+        </div>
+
+        <div class="platform-block">
+            <div class="platform-header"><span class="platform-name">Meesho</span><span class="platform-stats">Live search</span></div>
+            <p>Find matching products on Meesho.</p>
+            <a class="view-button" href="https://www.meesho.com/search?q=${q}" target="_blank">View Meesho Results</a>
+        </div>
+
+        <div class="platform-block">
+            <div class="platform-header"><span class="platform-name">Amazon India</span><span class="platform-stats">Live search</span></div>
+            <p>Find matching products on Amazon.in.</p>
+            <a class="view-button" href="https://www.amazon.in/s?k=${q}" target="_blank">View Amazon Results</a>
+        </div>
+
+        <div class="platform-block">
+            <div class="platform-header"><span class="platform-name">Flipkart</span><span class="platform-stats">Live search</span></div>
+            <p>Find matching products on Flipkart.</p>
+            <a class="view-button" href="https://www.flipkart.com/search?q=${q}" target="_blank">View Flipkart Results</a>
+        </div>
+
+        <p id="liveStatus" style="color:#666;text-align:center;">Checking live matches in the background...</p>
     `;
-} else {
-    let html = "";
-    platformNames.forEach(p => {
-        const info = platforms[p];
-        if (info.items.length === 0) return;
-        html += `<div class="platform-block">
-            <div class="platform-header">
-                <span class="platform-name">${p}</span>
-                <span class="platform-stats">${info.items.length} listings &middot; ₹${info.min_price} - ₹${info.max_price}</span>
-            </div>
-            <table>
-                <tr><th>Item</th><th>Size</th><th>Price</th><th></th></tr>`;
-        info.items.forEach(item => {
-            html += `<tr>
-                <td>${item.title}</td>
-                <td>${item.size || "n/a"}</td>
-                <td>₹${item.price}</td>
-                <td><a href="${item.url}" target="_blank">View</a></td>
-            </tr>`;
+
+    debugBox.style.display = "none";
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 6000);
+
+    try {
+        const response = await fetch("/compare", {
+            method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({prompt:prompt}),
+            signal:controller.signal
         });
-        html += `</table></div>`;
-    });
-    results.innerHTML = html;
+
+        clearTimeout(timeout);
+        if (!response.ok) throw new Error("Server returned " + response.status);
+
+        const data = await response.json();
+        const liveItems = [];
+
+        Object.keys(data.platforms || {}).forEach(platform => {
+            (data.platforms[platform].items || []).forEach(item => {
+                if (!item.is_fallback) liveItems.push({...item, platform:platform});
+            });
+        });
+
+        const status = document.getElementById("liveStatus");
+
+        if (liveItems.length) {
+            let liveHtml = `<div class="platform-block"><h2>Live Matches</h2>
+                <table><tr><th>Platform</th><th>Item</th><th>Price</th><th></th></tr>`;
+
+            liveItems.forEach(item => {
+                liveHtml += `<tr>
+                    <td>${escapeHtml(item.platform)}</td>
+                    <td>${escapeHtml(item.title)}</td>
+                    <td>₹${item.price}</td>
+                    <td><a href="${item.url}" target="_blank">View</a></td>
+                </tr>`;
+            });
+
+            liveHtml += `</table></div>`;
+            results.insertAdjacentHTML("afterbegin", liveHtml);
+            if (status) status.textContent = "Live matches found.";
+        } else if (status) {
+            status.textContent = "Showing live retailer search links. Render could not retrieve product cards directly.";
+        }
+    } catch (error) {
+        clearTimeout(timeout);
+        const status = document.getElementById("liveStatus");
+        if (status) status.textContent = "Live scraping timed out. The search links above are ready.";
+    }
 }
+
+function escapeHtml(value) {
+    const div = document.createElement("div");
+    div.textContent = value;
+    return div.innerHTML;
 }
+
 </script>
 </body>
 </html>
